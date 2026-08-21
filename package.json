@@ -1,0 +1,40 @@
+{
+  "name": "market-data-engine",
+  "version": "1.0.0",
+  "description": "Market data ingestion engine for cryptocurrency and precious metals data",
+  "main": "index.js",
+  "scripts": {
+    "start": "NODE_ENV=production node index.js",
+    "dev": "nodemon index.js",
+    "lint": "eslint .",
+    "knip": "knip",
+    "check": "npm run lint && npm run knip"
+  },
+  "dependencies": {
+    "axios": "^1.19.0",
+    "dotenv": "^16.4.5",
+    "firebase-admin": "^13.5.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.8.1",
+    "globals": "^17.11.0",
+    "knip": "^6.32.2",
+    "nodemon": "^3.1.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git@github.com:value-visuals/market-data-engine.git"
+  },
+  "keywords": [
+    "market-data",
+    "crypto",
+    "precious-metals",
+    "firebase",
+    "firestore",
+    "ingestion"
+  ],
+  "author": "",
+  "license": "ISC",
+  "type": "module"
+}
