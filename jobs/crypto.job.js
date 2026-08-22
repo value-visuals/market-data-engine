@@ -1,28 +1,59 @@
 // jobs/crypto.job.js
 
+import axios from "axios";
+
 import {
-  saveCryptoCandles,
-  saveCryptoIngestionRun,
+  saveCandles,
+  getLatestCandle,
 } from "../repositories/market-data.repository.js";
 
-const COINGECKO_BASE =
+const COINGECKO_BASE_URL =
   "https://api.coingecko.com/api/v3";
 
 const COINGECKO_API_KEY =
   process.env.COINGECKO_API_KEY || null;
 
-const ASSETS = [
+/**
+ * CoinGecko's public/demo API has restrictions on
+ * historical range requests.
+ *
+ * Keep this configurable so the ingestion engine doesn't
+ * pretend that unlimited history is available.
+ */
+const MAX_HISTORY_DAYS = 365;
+
+const CRYPTO_ASSETS = [
   {
     symbol: "BTC",
-    id: "bitcoin",
+    coinId: "bitcoin",
   },
   {
     symbol: "ETH",
-    id: "ethereum",
+    coinId: "ethereum",
   },
 ];
 
-function buildHeaders() {
+/**
+ * Normal live ingestion interval.
+ *
+ * The scheduler itself can run every 15 minutes.
+ */
+const LIVE_LOOKBACK_MINUTES = 20;
+
+/**
+ * Fetch CoinGecko market history.
+ */
+async function fetchCoinGeckoHistory(
+  coinId,
+  start,
+  end
+) {
+  const params = {
+    vs_currency: "usd",
+    from: Math.floor(start.getTime() / 1000),
+    to: Math.floor(end.getTime() / 1000),
+  };
+
   const headers = {
     accept: "application/json",
   };
@@ -32,199 +63,350 @@ function buildHeaders() {
       COINGECKO_API_KEY;
   }
 
-  return headers;
+  const response = await axios.get(
+    `${COINGECKO_BASE_URL}/coins/${coinId}/market_chart/range`,
+    {
+      params,
+      headers,
+      timeout: 15_000,
+    }
+  );
+
+  return response.data;
 }
 
-async function fetchJson(url) {
-  const response = await fetch(url, {
-    headers: buildHeaders(),
-  });
-
-  const text = await response.text();
-
-  if (!response.ok) {
-    throw new Error(
-      `CoinGecko returned ${response.status}: ${text}`
-    );
-  }
-
-  try {
-    return JSON.parse(text);
-  } catch {
-    throw new Error(
-      "CoinGecko returned invalid JSON"
-    );
-  }
-}
-
-async function fetchMarketChart({
-  id,
-  days,
-}) {
-  const url =
-    `${COINGECKO_BASE}/coins/${id}/market_chart` +
-    `?vs_currency=usd&days=${days}`;
-
-  return fetchJson(url);
-}
-
-function buildCandles(data) {
+/**
+ * Normalize CoinGecko response.
+ */
+function normalizeCryptoCandles(
+  symbol,
+  data
+) {
   const prices = Array.isArray(data?.prices)
     ? data.prices
     : [];
 
-  const candles = prices
-    .map(([timestamp, price]) => {
-      const t = Number(timestamp);
-      const value = Number(price);
+  const unique = new Map();
 
-      if (
-        !Number.isFinite(t) ||
-        !Number.isFinite(value)
-      ) {
-        return null;
-      }
-
-      return {
-        t,
-        o: value,
-        h: value,
-        l: value,
-        c: value,
-      };
-    })
-    .filter(Boolean)
-    .sort((a, b) => a.t - b.t);
-
-  const unique = [];
-  let lastTimestamp = null;
-
-  for (const candle of candles) {
-    if (candle.t === lastTimestamp) {
-      unique[unique.length - 1] = candle;
-    } else {
-      unique.push(candle);
-      lastTimestamp = candle.t;
+  for (const entry of prices) {
+    if (!Array.isArray(entry)) {
+      continue;
     }
+
+    const timestamp = Number(entry[0]);
+    const price = Number(entry[1]);
+
+    if (
+      !Number.isFinite(timestamp) ||
+      !Number.isFinite(price)
+    ) {
+      continue;
+    }
+
+    unique.set(timestamp, {
+      symbol,
+      timestamp,
+      open: price,
+      high: price,
+      low: price,
+      close: price,
+      price,
+      volume: null,
+    });
   }
 
-  return unique;
+  return Array.from(unique.values()).sort(
+    (a, b) => a.timestamp - b.timestamp
+  );
 }
 
-async function ingestAsset({
+/**
+ * Calculate a start date for historical backfill.
+ */
+function historyStart(days) {
+  const end = new Date();
+
+  return new Date(
+    end.getTime() -
+      days * 24 * 60 * 60 * 1000
+  );
+}
+
+/**
+ * Ingest historical crypto data.
+ *
+ * This is used for initial historical population.
+ */
+export async function ingestCryptoHistory({
   symbol,
-  id,
-  days,
+  coinId,
+  days = MAX_HISTORY_DAYS,
 }) {
-  const endMs = Date.now();
-  const startMs =
-    endMs - days * 24 * 60 * 60 * 1000;
+  const end = new Date();
 
-  console.log(
-    `\n[crypto] Starting ${symbol} ingestion`
-  );
-
-  console.log(
-    `  Range: ${new Date(startMs).toISOString()} → ${new Date(
-      endMs
-    ).toISOString()}`
-  );
-
-  const data = await fetchMarketChart({
-    id,
+  const safeDays = Math.min(
     days,
-  });
+    MAX_HISTORY_DAYS
+  );
 
-  const candles = buildCandles(data);
+  const start = historyStart(safeDays);
+
+  console.log(
+    `\n[crypto] Historical ${symbol}`
+  );
+
+  console.log(
+    `  Range: ${start.toISOString()} → ${end.toISOString()}`
+  );
+
+  const data = await fetchCoinGeckoHistory(
+    coinId,
+    start,
+    end
+  );
+
+  const candles =
+    normalizeCryptoCandles(
+      symbol,
+      data
+    );
 
   console.log(
     `  CoinGecko returned ${candles.length} price points`
   );
 
   if (candles.length === 0) {
-    console.log(
-      `  No ${symbol} data returned. Nothing to save.`
-    );
-
     return {
       symbol,
-      saved: 0,
+      written: 0,
+      total: 0,
     };
   }
 
-  // CoinGecko's free market_chart endpoint gives us
-  // price points rather than true OHLC candles.
-  //
-  // We intentionally preserve that fact by using the
-  // same price for o/h/l/c.
-  const result = await saveCryptoCandles({
+  const result = await saveCandles(
     symbol,
-    interval: "auto",
-    candles,
-    provider: "coingecko",
-    currency: "USD",
-  });
-
-  await saveCryptoIngestionRun({
-    symbol,
-    interval: "auto",
-    startMs,
-    endMs,
-    provider: "coingecko",
-    candleCount: result.saved,
-  });
+    candles
+  );
 
   console.log(
-    `  ✓ Saved ${result.saved} ${symbol} candles`
+    `  ✓ ${symbol}: ${result.written} written`
   );
 
   return {
     symbol,
-    saved: result.saved,
+    ...result,
   };
 }
 
-export async function ingestCrypto({
-  days = 7,
-  symbols = ["BTC", "ETH"],
-} = {}) {
-  const wanted = ASSETS.filter((asset) =>
-    symbols
-      .map((symbol) => String(symbol).toUpperCase())
-      .includes(asset.symbol)
+/**
+ * Ingest one crypto asset incrementally.
+ *
+ * Firebase:
+ *   1 read → latest candle
+ *
+ * API:
+ *   only request data newer than latest
+ */
+export async function ingestCryptoAsset({
+  symbol,
+  coinId,
+  days,
+}) {
+  console.log(
+    `\n[crypto] Starting ${symbol} ingestion`
   );
 
-  if (wanted.length === 0) {
-    throw new Error(
-      "No supported crypto symbols requested"
+  const latest =
+    await getLatestCandle(symbol);
+
+  const end = new Date();
+
+  let start;
+
+  if (latest?.timestamp) {
+    /*
+     * Start immediately after the last stored point.
+     *
+     * This prevents repeatedly downloading the same
+     * historical range.
+     */
+    start = new Date(
+      Number(latest.timestamp) + 1
+    );
+  } else {
+    /*
+     * No data exists yet.
+     *
+     * Use the configured historical period.
+     */
+    const historyDays =
+      days ?? MAX_HISTORY_DAYS;
+
+    start = historyStart(
+      Math.min(
+        historyDays,
+        MAX_HISTORY_DAYS
+      )
     );
   }
 
+  /*
+   * Safety fallback:
+   *
+   * If the latest candle is extremely recent, request
+   * a small lookback. This helps recover a missing point
+   * if the upstream API has slightly different timestamps.
+   */
+  if (
+    latest?.timestamp &&
+    end.getTime() - start.getTime() <
+      LIVE_LOOKBACK_MINUTES * 60 * 1000
+  ) {
+    start = new Date(
+      end.getTime() -
+        LIVE_LOOKBACK_MINUTES *
+          60 *
+          1000
+    );
+  }
+
+  console.log(
+    `  Range: ${start.toISOString()} → ${end.toISOString()}`
+  );
+
+  const data =
+    await fetchCoinGeckoHistory(
+      coinId,
+      start,
+      end
+    );
+
+  const candles =
+    normalizeCryptoCandles(
+      symbol,
+      data
+    );
+
+  /*
+   * If we already had data, only keep points
+   * newer than the stored latest candle.
+   */
+  const newCandles = latest?.timestamp
+    ? candles.filter(
+        (candle) =>
+          candle.timestamp >
+          Number(latest.timestamp)
+      )
+    : candles;
+
+  console.log(
+    `  CoinGecko returned ${candles.length} price points`
+  );
+
+  console.log(
+    `  New price points: ${newCandles.length}`
+  );
+
+  if (newCandles.length === 0) {
+    return {
+      symbol,
+      written: 0,
+      total: 0,
+    };
+  }
+
+  const result = await saveCandles(
+    symbol,
+    newCandles
+  );
+
+  console.log(
+    `  ✓ ${symbol}: ${result.written} written`
+  );
+
+  return {
+    symbol,
+    ...result,
+  };
+}
+
+/**
+ * Initial historical ingestion.
+ *
+ * This should only be called when historical coverage
+ * is missing.
+ */
+export async function ingestCryptoHistoryIfNeeded({
+  symbol,
+  coinId,
+  days = MAX_HISTORY_DAYS,
+}) {
+  const latest =
+    await getLatestCandle(symbol);
+
+  if (!latest) {
+    console.log(
+      `\n[crypto] ${symbol} has no stored data. Loading ${days} days.`
+    );
+
+    return ingestCryptoHistory({
+      symbol,
+      coinId,
+      days,
+    });
+  }
+
+  /*
+   * We intentionally do not automatically re-download
+   * 365 days on every restart.
+   */
+  console.log(
+    `\n[crypto] ${symbol} historical data already exists.`
+  );
+
+  console.log(
+    `  Latest: ${new Date(
+      Number(latest.timestamp)
+    ).toISOString()}`
+  );
+
+  return {
+    symbol,
+    written: 0,
+    total: 0,
+    skipped: true,
+  };
+}
+
+/**
+ * Normal live ingestion for all assets.
+ */
+export async function ingestCrypto() {
   const results = [];
 
-  for (const asset of wanted) {
-    try {
-      const result = await ingestAsset({
-        ...asset,
-        days,
-      });
+  for (const asset of CRYPTO_ASSETS) {
+    const result =
+      await ingestCryptoAsset(asset);
 
-      results.push({
-        ...result,
-        ok: true,
-      });
-    } catch (error) {
-      console.error(
-        `\n[crypto] ✗ ${asset.symbol} ingestion failed`
+    results.push(result);
+  }
+
+  return results;
+}
+
+/**
+ * Initial historical backfill for all assets.
+ */
+export async function backfillCrypto() {
+  const results = [];
+
+  for (const asset of CRYPTO_ASSETS) {
+    const result =
+      await ingestCryptoHistoryIfNeeded(
+        asset
       );
-      console.error(`  ${error.message}`);
 
-      results.push({
-        symbol: asset.symbol,
-        ok: false,
-        error: error.message,
-      });
-    }
+    results.push(result);
   }
 
   return results;
