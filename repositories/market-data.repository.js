@@ -1,281 +1,299 @@
 // repositories/market-data.repository.js
 
-import { admin, db } from "../config/firebase.js";
+import { db } from "../config/firebase.js";
+
+const MARKET_DATA_COLLECTION = "marketData";
+const CANDLES_COLLECTION = "candles";
+
+const MAX_BATCH_SIZE = 500;
 
 /**
- * Firestore layout
+ * Build a deterministic document ID.
  *
- * marketData/
- *   crypto/
- *     BTC/
- *       candles/
- *         {timestamp}
- *
- *   metals/
- *     XAU/
- *       candles/
- *         {timestamp}
- *
- * The timestamp is stored as the document ID so that the same
- * candle can safely be written again without creating duplicates.
+ * Example:
+ * BTC + 1787344080000
+ * -> BTC_1787344080000
  */
+function candleDocumentId(symbol, timestamp) {
+  const normalizedSymbol = String(symbol)
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9_-]/g, "_");
 
-// ---------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------
-
-function timestampToDocId(timestamp) {
-  const value =
-    timestamp instanceof Date
-      ? timestamp.getTime()
-      : Number(timestamp);
-
-  if (!Number.isFinite(value)) {
-    throw new Error(`Invalid candle timestamp: ${timestamp}`);
-  }
-
-  return String(Math.floor(value));
+  return `${normalizedSymbol}_${timestamp}`;
 }
 
-function normalizeCandle(candle) {
-  if (!candle || typeof candle !== "object") {
-    throw new Error("Invalid candle");
+/**
+ * Normalize a candle timestamp into milliseconds.
+ *
+ * Supports:
+ *   - Date objects
+ *   - Unix seconds
+ *   - Unix milliseconds
+ *   - ISO date strings
+ */
+function normalizeTimestamp(value) {
+  if (value instanceof Date) {
+    const timestamp = value.getTime();
+
+    if (!Number.isFinite(timestamp)) {
+      throw new Error(`Invalid candle timestamp: ${value}`);
+    }
+
+    return timestamp;
   }
 
-  const timestamp =
-    candle.t ??
-    candle.timestamp ??
-    candle.time;
+  // Support ISO date strings such as:
+  // 2026-08-14T00:00:00.000Z
+  if (typeof value === "string") {
+    const trimmed = value.trim();
 
-  const timestampMs =
-    typeof timestamp === "string" && !/^\d+$/.test(timestamp)
-      ? new Date(timestamp).getTime()
-      : Number(timestamp);
+    if (!trimmed) {
+      throw new Error(`Invalid candle timestamp: ${value}`);
+    }
 
-  if (!Number.isFinite(timestampMs)) {
-    throw new Error(
-      `Invalid candle timestamp: ${timestamp}`
+    // Numeric strings should still be treated as Unix timestamps.
+    if (/^-?\d+(?:\.\d+)?$/.test(trimmed)) {
+      const numeric = Number(trimmed);
+
+      if (!Number.isFinite(numeric)) {
+        throw new Error(`Invalid candle timestamp: ${value}`);
+      }
+
+      return numeric < 1_000_000_000_000
+        ? numeric * 1000
+        : numeric;
+    }
+
+    const parsed = Date.parse(trimmed);
+
+    if (!Number.isFinite(parsed)) {
+      throw new Error(`Invalid candle timestamp: ${value}`);
+    }
+
+    return parsed;
+  }
+
+  const numeric = Number(value);
+
+  if (!Number.isFinite(numeric)) {
+    throw new Error(`Invalid candle timestamp: ${value}`);
+  }
+
+  // Treat values below 1e12 as Unix seconds.
+  return numeric < 1_000_000_000_000
+    ? numeric * 1000
+    : numeric;
+}
+
+/**
+ * Return the candles collection for a symbol.
+ */
+function candlesCollection(symbol) {
+  return db
+    .collection(MARKET_DATA_COLLECTION)
+    .doc(String(symbol).toUpperCase())
+    .collection(CANDLES_COLLECTION);
+}
+
+/**
+ * Save candles.
+ *
+ * IMPORTANT:
+ *
+ * We intentionally do NOT read every existing document before writing.
+ *
+ * The ingestion layer determines what data is new by looking at the
+ * latest stored timestamp.
+ *
+ * Deterministic document IDs make this operation idempotent.
+ */
+export async function saveCandles(symbol, candles) {
+  if (!symbol) {
+    throw new Error("saveCandles requires a symbol");
+  }
+
+  if (!Array.isArray(candles)) {
+    throw new Error("saveCandles requires an array of candles");
+  }
+
+  if (candles.length === 0) {
+    return {
+      written: 0,
+      total: 0,
+    };
+  }
+
+  const collection = candlesCollection(symbol);
+
+  const uniqueCandles = new Map();
+
+  for (const candle of candles) {
+    if (!candle) {
+      continue;
+    }
+
+    const timestamp = normalizeTimestamp(
+      candle.timestamp ??
+        candle.time ??
+        candle.t
     );
+
+    uniqueCandles.set(timestamp, {
+      ...candle,
+      timestamp,
+    });
   }
 
-  return {
-    t: Math.floor(timestampMs),
-    o: candle.o != null ? Number(candle.o) : null,
-    h: candle.h != null ? Number(candle.h) : null,
-    l: candle.l != null ? Number(candle.l) : null,
-    c: candle.c != null ? Number(candle.c) : null,
+  const normalizedCandles = Array.from(
+    uniqueCandles.values()
+  ).sort(
+    (a, b) => a.timestamp - b.timestamp
+  );
 
-    ...(candle.v != null
-      ? { v: Number(candle.v) }
-      : candle.volume != null
-        ? { v: Number(candle.volume) }
-        : {}),
-  };
-}
+  let written = 0;
 
-function assertValidSymbol(symbol) {
-  if (!symbol || typeof symbol !== "string") {
-    throw new Error("A symbol is required");
-  }
+  for (
+    let batchStart = 0;
+    batchStart < normalizedCandles.length;
+    batchStart += MAX_BATCH_SIZE
+  ) {
+    const batchCandles = normalizedCandles.slice(
+      batchStart,
+      batchStart + MAX_BATCH_SIZE
+    );
 
-  return symbol.trim().toUpperCase();
-}
-
-function assertValidInterval(interval) {
-  if (!interval || typeof interval !== "string") {
-    throw new Error("An interval is required");
-  }
-
-  return interval.trim();
-}
-
-// ---------------------------------------------------------
-// Crypto candles
-// ---------------------------------------------------------
-
-export async function saveCryptoCandles({
-  symbol,
-  interval,
-  candles,
-  provider = null,
-  currency = "USD",
-}) {
-  const normalizedSymbol = assertValidSymbol(symbol);
-  const normalizedInterval = assertValidInterval(interval);
-
-  if (!Array.isArray(candles) || candles.length === 0) {
-    return {
-      saved: 0,
-      symbol: normalizedSymbol,
-      interval: normalizedInterval,
-    };
-  }
-
-  const collectionRef = db
-    .collection("marketData")
-    .doc("crypto")
-    .collection(normalizedSymbol)
-    .doc("candles")
-    .collection(normalizedInterval);
-
-  let saved = 0;
-
-  // Firestore batch writes are limited to 500 operations.
-  for (let i = 0; i < candles.length; i += 500) {
-    const chunk = candles.slice(i, i + 500);
     const batch = db.batch();
 
-    for (const rawCandle of chunk) {
-      const candle = normalizeCandle(rawCandle);
-      const docId = timestampToDocId(candle.t);
+    for (const candle of batchCandles) {
+      const id = candleDocumentId(
+        symbol,
+        candle.timestamp
+      );
 
-      const ref = collectionRef.doc(docId);
+      const ref = collection.doc(id);
 
       batch.set(
         ref,
         {
           ...candle,
-          symbol: normalizedSymbol,
-          interval: normalizedInterval,
-          currency: String(currency).toUpperCase(),
-          provider,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          symbol: String(symbol).toUpperCase(),
+          timestamp: candle.timestamp,
+          updatedAt: new Date().toISOString(),
         },
-        { merge: true }
-      );
-    }
-
-    await batch.commit();
-    saved += chunk.length;
-  }
-
-  return {
-    saved,
-    symbol: normalizedSymbol,
-    interval: normalizedInterval,
-  };
-}
-
-// ---------------------------------------------------------
-// Metals candles
-// ---------------------------------------------------------
-
-export async function saveMetalCandles({
-  symbol,
-  interval,
-  candles,
-  provider = "api-ninjas",
-  currency = "USD",
-}) {
-  const normalizedSymbol = assertValidSymbol(symbol);
-  const normalizedInterval = assertValidInterval(interval);
-
-  if (!Array.isArray(candles) || candles.length === 0) {
-    return {
-      saved: 0,
-      symbol: normalizedSymbol,
-      interval: normalizedInterval,
-    };
-  }
-
-  const collectionRef = db
-    .collection("marketData")
-    .doc("metals")
-    .collection(normalizedSymbol)
-    .doc("candles")
-    .collection(normalizedInterval);
-
-  let saved = 0;
-
-  for (let i = 0; i < candles.length; i += 500) {
-    const chunk = candles.slice(i, i + 500);
-    const batch = db.batch();
-
-    for (const rawCandle of chunk) {
-      const candle = normalizeCandle(rawCandle);
-      const docId = timestampToDocId(candle.t);
-
-      const ref = collectionRef.doc(docId);
-
-      batch.set(
-        ref,
         {
-          ...candle,
-          symbol: normalizedSymbol,
-          interval: normalizedInterval,
-          currency: String(currency).toUpperCase(),
-          provider,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        },
-        { merge: true }
+          merge: false,
+        }
       );
+
+      written += 1;
     }
 
     await batch.commit();
-    saved += chunk.length;
   }
 
   return {
-    saved,
-    symbol: normalizedSymbol,
-    interval: normalizedInterval,
+    written,
+    total: normalizedCandles.length,
   };
 }
 
-// ---------------------------------------------------------
-// Optional metadata helpers
-// ---------------------------------------------------------
+/**
+ * Get the most recent candle.
+ *
+ * This is intentionally ONE Firestore read.
+ *
+ * Normal ingestion uses this to determine where to resume.
+ */
+export async function getLatestCandle(symbol) {
+  const collection = candlesCollection(symbol);
 
-export async function saveCryptoIngestionRun({
-  symbol,
-  interval,
-  startMs,
-  endMs,
-  provider,
-  candleCount,
-}) {
-  const ref = db
-    .collection("marketData")
-    .doc("crypto")
-    .collection("ingestionRuns")
-    .doc();
+  const snapshot = await collection
+    .orderBy("timestamp", "desc")
+    .limit(1)
+    .get();
 
-  await ref.set({
-    symbol: String(symbol).toUpperCase(),
-    interval,
-    startMs,
-    endMs,
-    provider,
-    candleCount,
-    completedAt: admin.firestore.FieldValue.serverTimestamp(),
-  });
+  if (snapshot.empty) {
+    return null;
+  }
 
-  return ref.id;
+  const doc = snapshot.docs[0];
+
+  return {
+    id: doc.id,
+    ...doc.data(),
+  };
 }
 
-export async function saveMetalIngestionRun({
+/**
+ * Get the oldest candle.
+ *
+ * Used only when determining whether historical backfill
+ * is required.
+ */
+export async function getEarliestCandle(symbol) {
+  const collection = candlesCollection(symbol);
+
+  const snapshot = await collection
+    .orderBy("timestamp", "asc")
+    .limit(1)
+    .get();
+
+  if (snapshot.empty) {
+    return null;
+  }
+
+  const doc = snapshot.docs[0];
+
+  return {
+    id: doc.id,
+    ...doc.data(),
+  };
+}
+
+/**
+ * Return the stored time bounds for an asset.
+ *
+ * This performs two Firestore reads:
+ *
+ *   1. oldest candle
+ *   2. newest candle
+ *
+ * This is used only during startup/backfill decisions.
+ */
+export async function getCandleBounds(symbol) {
+  const [earliest, latest] = await Promise.all([
+    getEarliestCandle(symbol),
+    getLatestCandle(symbol),
+  ]);
+
+  return {
+    earliest,
+    latest,
+  };
+}
+
+/**
+ * Read candles within a time range.
+ */
+export async function getCandles(
   symbol,
-  interval,
-  startMs,
-  endMs,
-  provider,
-  candleCount,
-}) {
-  const ref = db
-    .collection("marketData")
-    .doc("metals")
-    .collection("ingestionRuns")
-    .doc();
+  startTimestamp,
+  endTimestamp
+) {
+  const collection = candlesCollection(symbol);
 
-  await ref.set({
-    symbol: String(symbol).toUpperCase(),
-    interval,
-    startMs,
-    endMs,
-    provider,
-    candleCount,
-    completedAt: admin.firestore.FieldValue.serverTimestamp(),
-  });
+  const start = normalizeTimestamp(startTimestamp);
+  const end = normalizeTimestamp(endTimestamp);
 
-  return ref.id;
+  const snapshot = await collection
+    .where("timestamp", ">=", start)
+    .where("timestamp", "<=", end)
+    .orderBy("timestamp", "asc")
+    .get();
+
+  return snapshot.docs.map((doc) => ({
+    id: doc.id,
+    ...doc.data(),
+  }));
 }
