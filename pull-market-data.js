@@ -1,224 +1,74 @@
 import "dotenv/config";
 
-import {
-  ingestCrypto,
-  backfillCrypto,
-} from "./jobs/crypto.job.js";
+import { ingestCrypto, backfillCrypto } from "./jobs/crypto.job.js";
+import { ingestMetals, backfillMetals } from "./jobs/metals.job.js";
 
-import {
-  ingestMetals,
-  backfillMetals,
-} from "./jobs/metals.job.js";
-
-const INTERVAL_MS =
-  15 * 60 * 1000;
-
+const INTERVAL_MS = 30 * 60 * 1000;
 let running = false;
-let backfillComplete = false;
 
-/**
- * Historical backfill.
- *
- * This is NOT performed blindly on every startup.
- *
- * Each asset checks Firebase first.
- */
 async function runBackfill() {
-  console.log(
-    "\n================================="
-  );
-
-  console.log(
-    "Historical Backfill"
-  );
-
-  console.log(
-    "================================="
-  );
-
   const startedAt = Date.now();
+  console.log("\n[backfill] Checking history...");
 
   try {
-    console.log(
-      "[ backfill ] Checking existing crypto history..."
-    );
-
     await backfillCrypto();
-
-    console.log(
-      "\n[ backfill ] Checking existing metal history..."
-    );
-
     await backfillMetals();
 
-    const duration =
-      Date.now() - startedAt;
-
     console.log(
-      `\n[ backfill ] Complete in ${(
-        duration / 1000
-      ).toFixed(2)}s`
+      `[backfill] Complete in ${((Date.now() - startedAt) / 1000).toFixed(2)}s`
     );
-
-    backfillComplete = true;
+    return true;
   } catch (error) {
-    console.error(
-      "[ backfill ] Failed:"
-    );
-
-    if (error.response?.data) {
-      console.error(
-        error.response.data
-      );
-    } else {
-      console.error(error);
-    }
+    console.error("[backfill] Failed:", error.response?.data || error);
+    return false;
   }
 }
 
-/**
- * Normal live ingestion.
- */
 async function runIngestion() {
   if (running) {
-    console.log(
-      "\n[ scheduler ] Previous ingestion is still running. Skipping this cycle."
-    );
-
+    console.log("[scheduler] Previous ingestion still running; skipping.");
     return;
   }
 
   running = true;
-
   const startedAt = Date.now();
 
-  console.log(
-    "\n================================="
-  );
-
-  console.log(
-    "Market Data Engine"
-  );
-
-  console.log(
-    "================================="
-  );
-
-  console.log(
-    `[ scheduler ] Ingestion started: ${new Date().toISOString()}`
-  );
-
   try {
-    await ingestCrypto();
+    console.log(
+      `[scheduler] Ingestion started: ${new Date().toISOString()}`
+    );
 
+    await ingestCrypto();
     await ingestMetals();
 
-    const duration =
-      Date.now() - startedAt;
-
     console.log(
-      "\n================================="
+      `[scheduler] Complete in ${((Date.now() - startedAt) / 1000).toFixed(2)}s`
     );
-
     console.log(
-      "Ingestion complete."
-    );
-
-    console.log(
-      `[ scheduler ] Duration: ${(
-        duration / 1000
-      ).toFixed(2)}s`
-    );
-
-    console.log(
-      `[ scheduler ] Next run: ${new Date(
-        Date.now() +
-          INTERVAL_MS
-      ).toISOString()}`
-    );
-
-    console.log(
-      "================================="
+      `[scheduler] Next run: ${new Date(Date.now() + INTERVAL_MS).toISOString()}`
     );
   } catch (error) {
-    console.error(
-      "\n================================="
-    );
-
-    console.error(
-      "Ingestion failed:"
-    );
-
-    console.error(error);
-
-    console.error(
-      "================================="
-    );
+    console.error("[scheduler] Ingestion failed:", error);
   } finally {
     running = false;
   }
 }
 
-/**
- * Application startup.
- */
 async function start() {
   console.log(
-    "================================="
+    `[scheduler] Market Data Engine | Interval: ${INTERVAL_MS / 1000}s`
   );
 
-  console.log(
-    "Market Data Engine"
-  );
-
-  console.log(
-    "================================="
-  );
-
-  console.log(
-    `[ scheduler ] Interval: ${
-      INTERVAL_MS / 1000
-    } seconds`
-  );
-
-  /*
-   * Check historical coverage.
-   *
-   * If data already exists, this should finish
-   * very quickly and NOT download 365 days again.
-   */
-  await runBackfill();
-
-  if (!backfillComplete) {
-    console.error(
-      "[ scheduler ] Backfill failed. Live ingestion will not start."
-    );
-
+  if (!(await runBackfill())) {
+    console.error("[scheduler] Backfill failed. Live ingestion stopped.");
     return;
   }
 
-  /*
-   * Immediately collect the newest data.
-   */
   await runIngestion();
-
-  /*
-   * Continue on schedule.
-   */
-  setInterval(
-    async () => {
-      await runIngestion();
-    },
-    INTERVAL_MS
-  );
+  setInterval(runIngestion, INTERVAL_MS);
 }
 
 start().catch((error) => {
-  console.error(
-    "\nFatal startup error:"
-  );
-
-  console.error(error);
-
+  console.error("[fatal] Startup error:", error);
   process.exitCode = 1;
 });

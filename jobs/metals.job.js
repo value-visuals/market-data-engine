@@ -29,7 +29,10 @@ const METALS = [
 const PERIOD = "1h";
 
 /**
- * Desired historical coverage.
+ * Maximum desired historical coverage.
+ *
+ * This is a MAXIMUM, not an instruction to blindly download
+ * the entire period if historical data is already present.
  */
 const HISTORY_DAYS =
   30 * 365;
@@ -51,6 +54,10 @@ if (!API_KEY) {
     "[metals.job] API Ninjas API key is not configured."
   );
 }
+
+/* ============================================================================
+   HELPERS
+   ========================================================================== */
 
 /**
  * Fetch historical metal prices.
@@ -132,22 +139,29 @@ function normalizeMetalCandles(
 
     unique.set(timestampMs, {
       symbol,
+
       timestamp: timestampMs,
+
       open: Number.isFinite(open)
         ? open
         : null,
+
       high: Number.isFinite(high)
         ? high
         : null,
+
       low: Number.isFinite(low)
         ? low
         : null,
+
       close: Number.isFinite(close)
         ? close
         : null,
+
       price: Number.isFinite(close)
         ? close
         : null,
+
       volume: Number.isFinite(volume)
         ? volume
         : null,
@@ -161,6 +175,10 @@ function normalizeMetalCandles(
       a.timestamp - b.timestamp
   );
 }
+
+/* ============================================================================
+   RANGE INGESTION
+   ========================================================================== */
 
 /**
  * Ingest one metal range.
@@ -245,19 +263,37 @@ export async function ingestMetal({
   };
 }
 
+/* ============================================================================
+   HISTORICAL BACKFILL
+   ========================================================================== */
+
 /**
  * Backfill one metal.
  *
  * IMPORTANT:
  *
- * We only do this when historical data is missing.
+ * The job does NOT blindly assume the entire HISTORY_DAYS
+ * period needs to be downloaded.
+ *
+ * It checks Firebase before starting and after every chunk.
+ *
+ * Once historical data exists, the backfill stops.
+ *
+ * This prevents the job from continuing through the entire
+ * configured historical window unnecessarily.
  */
 export async function backfillMetal({
   symbol,
   name,
   days = HISTORY_DAYS,
 }) {
-  const latest =
+  /*
+   * First check.
+   *
+   * If this series already exists, there is nothing to
+   * backfill.
+   */
+  let latest =
     await getLatestCandle(symbol);
 
   if (latest) {
@@ -280,18 +316,55 @@ export async function backfillMetal({
   }
 
   console.log(
-    `\n[metals] ${symbol}: loading ${days} days`
+    `\n[metals] ${symbol}: loading up to ${days} days`
   );
 
   const end = new Date();
 
   let chunkEnd = end;
-  let daysRemaining = days;
+
+  let daysRemaining =
+    Math.min(
+      Number(days) || HISTORY_DAYS,
+      HISTORY_DAYS
+    );
 
   let totalWritten = 0;
   let totalReturned = 0;
 
+  /*
+   * Process historical data backwards in chunks.
+   */
   while (daysRemaining > 0) {
+    /*
+     * IMPORTANT:
+     *
+     * Re-check Firebase BEFORE every chunk.
+     *
+     * Another process/job may have populated this series
+     * since the initial check.
+     */
+    latest =
+      await getLatestCandle(symbol);
+
+    if (latest) {
+      console.log(
+        `\n[metals] ${symbol} data detected during backfill.`
+      );
+
+      console.log(
+        `  Latest: ${new Date(
+          Number(latest.timestamp)
+        ).toISOString()}`
+      );
+
+      console.log(
+        `  ✓ ${symbol} backfill stopped.`
+      );
+
+      break;
+    }
+
     const chunkDays =
       Math.min(
         HISTORICAL_CHUNK_DAYS,
@@ -309,7 +382,7 @@ export async function backfillMetal({
       );
 
     console.log(
-      `\n[ backfill ] ${symbol}: ` +
+      `\n[backfill] ${symbol}: ` +
       `${chunkStart.toISOString()} → ` +
       `${chunkEnd.toISOString()}`
     );
@@ -324,23 +397,84 @@ export async function backfillMetal({
       });
 
     totalWritten +=
-      result.written;
+      Number(result.written) || 0;
 
     totalReturned +=
-      result.total;
+      Number(result.total) || 0;
 
+    /*
+     * IMPORTANT:
+     *
+     * If this chunk successfully wrote data, the series
+     * now exists in Firebase.
+     *
+     * There is no reason to continue blindly through the
+     * remaining historical chunks.
+     */
+    if (
+      Number(result.written) > 0
+    ) {
+      console.log(
+        `\n[metals] ${symbol}: historical data found.`
+      );
+
+      console.log(
+        `  ✓ Backfill stopped after first populated chunk.`
+      );
+
+      break;
+    }
+
+    /*
+     * No candles were written.
+     *
+     * Move further backwards.
+     */
     chunkEnd = chunkStart;
 
     daysRemaining -=
       chunkDays;
   }
 
+  /*
+   * Final state check.
+   */
+  latest =
+    await getLatestCandle(symbol);
+
+  if (latest) {
+    console.log(
+      `\n[metals] ${symbol} backfill complete.`
+    );
+
+    console.log(
+      `  Latest stored candle: ${new Date(
+        Number(latest.timestamp)
+      ).toISOString()}`
+    );
+  } else if (
+    daysRemaining <= 0
+  ) {
+    console.log(
+      `\n[metals] ${symbol}: reached maximum historical range.`
+    );
+
+    console.log(
+      `  No historical data was found within ${days} days.`
+    );
+  }
+
   return {
     symbol,
     written: totalWritten,
     total: totalReturned,
+    skipped: false,
   };
 }
+
+/* ============================================================================
+   INCREMENTAL LIVE INGESTION
+   ========================================================================== */
 
 /**
  * Incremental live ingestion.
@@ -470,6 +604,10 @@ export async function ingestMetalIncremental({
   };
 }
 
+/* ============================================================================
+   ALL METALS BACKFILL
+   ========================================================================== */
+
 /**
  * Backfill all metals.
  */
@@ -477,17 +615,38 @@ export async function backfillMetals() {
   const results = [];
 
   for (const metal of METALS) {
-    const result =
-      await backfillMetal({
-        ...metal,
-        days: HISTORY_DAYS,
-      });
+    try {
+      const result =
+        await backfillMetal({
+          ...metal,
+          days: HISTORY_DAYS,
+        });
 
-    results.push(result);
+      results.push(result);
+    } catch (error) {
+      console.error(
+        `[metals] Backfill failed ${metal.symbol}:`,
+        error?.message ||
+          error
+      );
+
+      results.push({
+        symbol: metal.symbol,
+        written: 0,
+        total: 0,
+        error:
+          error?.message ||
+          String(error),
+      });
+    }
   }
 
   return results;
 }
+
+/* ============================================================================
+   NORMAL LIVE INGESTION
+   ========================================================================== */
 
 /**
  * Normal live ingestion.
@@ -496,12 +655,29 @@ export async function ingestMetals() {
   const results = [];
 
   for (const metal of METALS) {
-    const result =
-      await ingestMetalIncremental(
-        metal
+    try {
+      const result =
+        await ingestMetalIncremental(
+          metal
+        );
+
+      results.push(result);
+    } catch (error) {
+      console.error(
+        `[metals] Ingestion failed ${metal.symbol}:`,
+        error?.message ||
+          error
       );
 
-    results.push(result);
+      results.push({
+        symbol: metal.symbol,
+        written: 0,
+        total: 0,
+        error:
+          error?.message ||
+          String(error),
+      });
+    }
   }
 
   return results;
