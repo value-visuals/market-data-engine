@@ -1,281 +1,728 @@
 // repositories/market-data.repository.js
 
-import { admin, db } from "../config/firebase.js";
+import { db } from "../config/firebase.js";
+
+const MARKET_DATA_COLLECTION = "marketData";
+const CANDLES_COLLECTION = "candles";
+const DATA_COLLECTION = "data";
+
+const MAX_BATCH_SIZE = 500;
 
 /**
- * Firestore layout
+ * ============================================================================
+ * SUPPORTED SERIES
+ * ============================================================================
  *
- * marketData/
- *   crypto/
- *     BTC/
- *       candles/
- *         {timestamp}
+ * Crypto:
  *
- *   metals/
- *     XAU/
- *       candles/
- *         {timestamp}
+ *   BTC/USD
+ *   BTC/EUR
+ *   BTC/GBP
+ *   ETH/USD
+ *   ETH/EUR
+ *   ETH/GBP
+ *   XMR/USD
+ *   XMR/EUR
+ *   XMR/GBP
  *
- * The timestamp is stored as the document ID so that the same
- * candle can safely be written again without creating duplicates.
+ * Metals:
+ *
+ *   XAU/USD
+ *   XAG/USD
+ *
+ * Metals deliberately remain USD/base only.
  */
 
-// ---------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------
+export const SUPPORTED_SYMBOLS = [
+  "BTC",
+  "ETH",
+  "XMR",
+];
 
-function timestampToDocId(timestamp) {
-  const value =
-    timestamp instanceof Date
-      ? timestamp.getTime()
-      : Number(timestamp);
+export const SUPPORTED_CURRENCIES = [
+  "USD",
+  "EUR",
+  "GBP",
+];
 
-  if (!Number.isFinite(value)) {
-    throw new Error(`Invalid candle timestamp: ${timestamp}`);
-  }
+export const SUPPORTED_METAL_SYMBOLS = [
+  "XAU",
+  "XAG",
+];
 
-  return String(Math.floor(value));
-}
+/* ============================================================================
+   NORMALIZATION
+   ========================================================================== */
 
-function normalizeCandle(candle) {
-  if (!candle || typeof candle !== "object") {
-    throw new Error("Invalid candle");
-  }
+function normalizeSymbol(symbol) {
+  const normalized = String(symbol || "")
+    .trim()
+    .toUpperCase();
 
-  const timestamp =
-    candle.t ??
-    candle.timestamp ??
-    candle.time;
-
-  const timestampMs =
-    typeof timestamp === "string" && !/^\d+$/.test(timestamp)
-      ? new Date(timestamp).getTime()
-      : Number(timestamp);
-
-  if (!Number.isFinite(timestampMs)) {
+  if (!normalized) {
     throw new Error(
-      `Invalid candle timestamp: ${timestamp}`
+      "A market-data symbol is required"
     );
   }
 
-  return {
-    t: Math.floor(timestampMs),
-    o: candle.o != null ? Number(candle.o) : null,
-    h: candle.h != null ? Number(candle.h) : null,
-    l: candle.l != null ? Number(candle.l) : null,
-    c: candle.c != null ? Number(candle.c) : null,
-
-    ...(candle.v != null
-      ? { v: Number(candle.v) }
-      : candle.volume != null
-        ? { v: Number(candle.volume) }
-        : {}),
-  };
+  return normalized;
 }
 
-function assertValidSymbol(symbol) {
-  if (!symbol || typeof symbol !== "string") {
-    throw new Error("A symbol is required");
+function normalizeCurrency(currency) {
+  const normalized = String(currency || "")
+    .trim()
+    .toUpperCase();
+
+  if (!/^[A-Z]{3}$/.test(normalized)) {
+    throw new Error(
+      `Invalid market-data currency: ${currency}`
+    );
   }
 
-  return symbol.trim().toUpperCase();
+  return normalized;
 }
 
-function assertValidInterval(interval) {
-  if (!interval || typeof interval !== "string") {
-    throw new Error("An interval is required");
+/**
+ * Normalize a candle timestamp into milliseconds.
+ *
+ * Supports:
+ *   - Date objects
+ *   - Unix seconds
+ *   - Unix milliseconds
+ *   - ISO date strings
+ */
+function normalizeTimestamp(value) {
+  if (value instanceof Date) {
+    const timestamp = value.getTime();
+
+    if (!Number.isFinite(timestamp)) {
+      throw new Error(
+        `Invalid candle timestamp: ${value}`
+      );
+    }
+
+    return timestamp;
   }
 
-  return interval.trim();
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+
+    if (!trimmed) {
+      throw new Error(
+        `Invalid candle timestamp: ${value}`
+      );
+    }
+
+    if (/^-?\d+(?:\.\d+)?$/.test(trimmed)) {
+      const numeric = Number(trimmed);
+
+      if (!Number.isFinite(numeric)) {
+        throw new Error(
+          `Invalid candle timestamp: ${value}`
+        );
+      }
+
+      return numeric < 1_000_000_000_000
+        ? numeric * 1000
+        : numeric;
+    }
+
+    const parsed = Date.parse(trimmed);
+
+    if (!Number.isFinite(parsed)) {
+      throw new Error(
+        `Invalid candle timestamp: ${value}`
+      );
+    }
+
+    return parsed;
+  }
+
+  const numeric = Number(value);
+
+  if (!Number.isFinite(numeric)) {
+    throw new Error(
+      `Invalid candle timestamp: ${value}`
+    );
+  }
+
+  return numeric < 1_000_000_000_000
+    ? numeric * 1000
+    : numeric;
 }
 
-// ---------------------------------------------------------
-// Crypto candles
-// ---------------------------------------------------------
+/* ============================================================================
+   FIRESTORE REFERENCES
+   ========================================================================== */
 
-export async function saveCryptoCandles({
+/**
+ * Crypto:
+ *
+ * marketData/{SYMBOL}/candles/{CURRENCY}/data
+ */
+function cryptoCandlesCollection(
   symbol,
-  interval,
-  candles,
-  provider = null,
-  currency = "USD",
-}) {
-  const normalizedSymbol = assertValidSymbol(symbol);
-  const normalizedInterval = assertValidInterval(interval);
+  currency
+) {
+  const normalizedSymbol =
+    normalizeSymbol(symbol);
 
-  if (!Array.isArray(candles) || candles.length === 0) {
+  const normalizedCurrency =
+    normalizeCurrency(currency);
+
+  return db
+    .collection(MARKET_DATA_COLLECTION)
+    .doc(normalizedSymbol)
+    .collection(CANDLES_COLLECTION)
+    .doc(normalizedCurrency)
+    .collection(DATA_COLLECTION);
+}
+
+/**
+ * Metals:
+ *
+ * marketData/{SYMBOL}/candles/USD/data
+ *
+ * Metals intentionally use USD/base only.
+ */
+function metalCandlesCollection(symbol) {
+  const normalizedSymbol =
+    normalizeSymbol(symbol);
+
+  return db
+    .collection(MARKET_DATA_COLLECTION)
+    .doc(normalizedSymbol)
+    .collection(CANDLES_COLLECTION)
+    .doc("USD")
+    .collection(DATA_COLLECTION);
+}
+
+/* ============================================================================
+   DOCUMENT IDS
+   ========================================================================== */
+
+/**
+ * Crypto:
+ *
+ * BTC_GBP_1787344080000
+ */
+function cryptoCandleDocumentId(
+  symbol,
+  currency,
+  timestamp
+) {
+  const normalizedSymbol =
+    normalizeSymbol(symbol);
+
+  const normalizedCurrency =
+    normalizeCurrency(currency);
+
+  return (
+    `${normalizedSymbol}_` +
+    `${normalizedCurrency}_` +
+    `${timestamp}`
+  );
+}
+
+/**
+ * Metals:
+ *
+ * XAU_USD_1787344080000
+ */
+function metalCandleDocumentId(
+  symbol,
+  timestamp
+) {
+  const normalizedSymbol =
+    normalizeSymbol(symbol);
+
+  return (
+    `${normalizedSymbol}_USD_` +
+    `${timestamp}`
+  );
+}
+
+/* ============================================================================
+   CANDLE NORMALIZATION
+   ========================================================================== */
+
+function normalizeCryptoCandles(
+  symbol,
+  currency,
+  candles
+) {
+  const normalizedSymbol =
+    normalizeSymbol(symbol);
+
+  const normalizedCurrency =
+    normalizeCurrency(currency);
+
+  const uniqueCandles = new Map();
+
+  for (const candle of candles) {
+    if (!candle) {
+      continue;
+    }
+
+    const timestamp =
+      normalizeTimestamp(
+        candle.timestamp ??
+          candle.time ??
+          candle.t
+      );
+
+    uniqueCandles.set(
+      timestamp,
+      {
+        ...candle,
+        symbol: normalizedSymbol,
+        currency: normalizedCurrency,
+        timestamp,
+      }
+    );
+  }
+
+  return Array.from(
+    uniqueCandles.values()
+  ).sort(
+    (a, b) =>
+      a.timestamp - b.timestamp
+  );
+}
+
+function normalizeMetalCandles(
+  symbol,
+  candles
+) {
+  const normalizedSymbol =
+    normalizeSymbol(symbol);
+
+  const uniqueCandles = new Map();
+
+  for (const candle of candles) {
+    if (!candle) {
+      continue;
+    }
+
+    const timestamp =
+      normalizeTimestamp(
+        candle.timestamp ??
+          candle.time ??
+          candle.t
+      );
+
+    uniqueCandles.set(
+      timestamp,
+      {
+        ...candle,
+        symbol: normalizedSymbol,
+        currency: "USD",
+        timestamp,
+      }
+    );
+  }
+
+  return Array.from(
+    uniqueCandles.values()
+  ).sort(
+    (a, b) =>
+      a.timestamp - b.timestamp
+  );
+}
+
+/* ============================================================================
+   SAVE CANDLES
+   ========================================================================== */
+
+/**
+ * Save candles.
+ *
+ * Supports BOTH existing call signatures:
+ *
+ * Crypto:
+ *
+ *   saveCandles(symbol, currency, candles)
+ *
+ * Metals:
+ *
+ *   saveCandles(symbol, candles)
+ *
+ * This preserves compatibility with the existing jobs.
+ */
+export async function saveCandles(
+  symbol,
+  currencyOrCandles,
+  maybeCandles
+) {
+  const normalizedSymbol =
+    normalizeSymbol(symbol);
+
+  let currency;
+  let candles;
+  let isMetalStyleCall = false;
+
+  /**
+   * Metals:
+   *
+   * saveCandles("XAU", candles)
+   */
+  if (
+    Array.isArray(currencyOrCandles) &&
+    maybeCandles === undefined
+  ) {
+    currency = "USD";
+    candles = currencyOrCandles;
+    isMetalStyleCall = true;
+  } else {
+    /**
+     * Crypto:
+     *
+     * saveCandles("BTC", "GBP", candles)
+     */
+    currency =
+      normalizeCurrency(
+        currencyOrCandles
+      );
+
+    candles = maybeCandles;
+  }
+
+  if (!Array.isArray(candles)) {
+    throw new Error(
+      "saveCandles requires an array of candles"
+    );
+  }
+
+  if (candles.length === 0) {
     return {
-      saved: 0,
+      written: 0,
+      total: 0,
       symbol: normalizedSymbol,
-      interval: normalizedInterval,
+      currency,
     };
   }
 
-  const collectionRef = db
-    .collection("marketData")
-    .doc("crypto")
-    .collection(normalizedSymbol)
-    .doc("candles")
-    .collection(normalizedInterval);
+  const normalizedCandles =
+    isMetalStyleCall
+      ? normalizeMetalCandles(
+          normalizedSymbol,
+          candles
+        )
+      : normalizeCryptoCandles(
+          normalizedSymbol,
+          currency,
+          candles
+        );
 
-  let saved = 0;
+  const collection =
+    isMetalStyleCall
+      ? metalCandlesCollection(
+          normalizedSymbol
+        )
+      : cryptoCandlesCollection(
+          normalizedSymbol,
+          currency
+        );
 
-  // Firestore batch writes are limited to 500 operations.
-  for (let i = 0; i < candles.length; i += 500) {
-    const chunk = candles.slice(i, i + 500);
+  let written = 0;
+
+  for (
+    let batchStart = 0;
+    batchStart <
+      normalizedCandles.length;
+    batchStart += MAX_BATCH_SIZE
+  ) {
+    const batchCandles =
+      normalizedCandles.slice(
+        batchStart,
+        batchStart +
+          MAX_BATCH_SIZE
+      );
+
     const batch = db.batch();
 
-    for (const rawCandle of chunk) {
-      const candle = normalizeCandle(rawCandle);
-      const docId = timestampToDocId(candle.t);
+    for (const candle of batchCandles) {
+      const id =
+        isMetalStyleCall
+          ? metalCandleDocumentId(
+              normalizedSymbol,
+              candle.timestamp
+            )
+          : cryptoCandleDocumentId(
+              normalizedSymbol,
+              currency,
+              candle.timestamp
+            );
 
-      const ref = collectionRef.doc(docId);
+      const ref =
+        collection.doc(id);
 
       batch.set(
         ref,
         {
           ...candle,
-          symbol: normalizedSymbol,
-          interval: normalizedInterval,
-          currency: String(currency).toUpperCase(),
-          provider,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+
+          symbol:
+            normalizedSymbol,
+
+          currency,
+
+          timestamp:
+            candle.timestamp,
+
+          updatedAt:
+            new Date().toISOString(),
         },
-        { merge: true }
-      );
-    }
-
-    await batch.commit();
-    saved += chunk.length;
-  }
-
-  return {
-    saved,
-    symbol: normalizedSymbol,
-    interval: normalizedInterval,
-  };
-}
-
-// ---------------------------------------------------------
-// Metals candles
-// ---------------------------------------------------------
-
-export async function saveMetalCandles({
-  symbol,
-  interval,
-  candles,
-  provider = "api-ninjas",
-  currency = "USD",
-}) {
-  const normalizedSymbol = assertValidSymbol(symbol);
-  const normalizedInterval = assertValidInterval(interval);
-
-  if (!Array.isArray(candles) || candles.length === 0) {
-    return {
-      saved: 0,
-      symbol: normalizedSymbol,
-      interval: normalizedInterval,
-    };
-  }
-
-  const collectionRef = db
-    .collection("marketData")
-    .doc("metals")
-    .collection(normalizedSymbol)
-    .doc("candles")
-    .collection(normalizedInterval);
-
-  let saved = 0;
-
-  for (let i = 0; i < candles.length; i += 500) {
-    const chunk = candles.slice(i, i + 500);
-    const batch = db.batch();
-
-    for (const rawCandle of chunk) {
-      const candle = normalizeCandle(rawCandle);
-      const docId = timestampToDocId(candle.t);
-
-      const ref = collectionRef.doc(docId);
-
-      batch.set(
-        ref,
         {
-          ...candle,
-          symbol: normalizedSymbol,
-          interval: normalizedInterval,
-          currency: String(currency).toUpperCase(),
-          provider,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        },
-        { merge: true }
+          merge: false,
+        }
       );
+
+      written += 1;
     }
 
     await batch.commit();
-    saved += chunk.length;
   }
 
   return {
-    saved,
-    symbol: normalizedSymbol,
-    interval: normalizedInterval,
+    written,
+    total:
+      normalizedCandles.length,
+    symbol:
+      normalizedSymbol,
+    currency,
   };
 }
 
-// ---------------------------------------------------------
-// Optional metadata helpers
-// ---------------------------------------------------------
+/* ============================================================================
+   LATEST CANDLE
+   ========================================================================== */
 
-export async function saveCryptoIngestionRun({
+/**
+ * Existing compatible API.
+ *
+ * Crypto:
+ *
+ *   getLatestCandle("BTC", "GBP")
+ *
+ * Metals:
+ *
+ *   getLatestCandle("XAU")
+ *
+ * Metals default to USD.
+ */
+export async function getLatestCandle(
   symbol,
-  interval,
-  startMs,
-  endMs,
-  provider,
-  candleCount,
-}) {
-  const ref = db
-    .collection("marketData")
-    .doc("crypto")
-    .collection("ingestionRuns")
-    .doc();
+  currency = "USD"
+) {
+  const normalizedSymbol =
+    normalizeSymbol(symbol);
 
-  await ref.set({
-    symbol: String(symbol).toUpperCase(),
-    interval,
-    startMs,
-    endMs,
-    provider,
-    candleCount,
-    completedAt: admin.firestore.FieldValue.serverTimestamp(),
-  });
+  const normalizedCurrency =
+    normalizeCurrency(currency);
 
-  return ref.id;
+  /**
+   * Metals always use USD.
+   *
+   * If the metals job calls:
+   *
+   * getLatestCandle("XAU")
+   *
+   * this resolves to the USD collection.
+   */
+  const collection =
+    cryptoCandlesCollection(
+      normalizedSymbol,
+      normalizedCurrency
+    );
+
+  const snapshot =
+    await collection
+      .orderBy(
+        "timestamp",
+        "desc"
+      )
+      .limit(1)
+      .get();
+
+  if (snapshot.empty) {
+    return null;
+  }
+
+  const doc =
+    snapshot.docs[0];
+
+  return {
+    id: doc.id,
+    ...doc.data(),
+  };
 }
 
-export async function saveMetalIngestionRun({
+/* ============================================================================
+   EARLIEST CANDLE
+   ========================================================================== */
+
+export async function getEarliestCandle(
   symbol,
-  interval,
-  startMs,
-  endMs,
-  provider,
-  candleCount,
-}) {
-  const ref = db
-    .collection("marketData")
-    .doc("metals")
-    .collection("ingestionRuns")
-    .doc();
+  currency = "USD"
+) {
+  const collection =
+    cryptoCandlesCollection(
+      symbol,
+      currency
+    );
 
-  await ref.set({
-    symbol: String(symbol).toUpperCase(),
-    interval,
-    startMs,
-    endMs,
-    provider,
-    candleCount,
-    completedAt: admin.firestore.FieldValue.serverTimestamp(),
-  });
+  const snapshot =
+    await collection
+      .orderBy(
+        "timestamp",
+        "asc"
+      )
+      .limit(1)
+      .get();
 
-  return ref.id;
+  if (snapshot.empty) {
+    return null;
+  }
+
+  const doc =
+    snapshot.docs[0];
+
+  return {
+    id: doc.id,
+    ...doc.data(),
+  };
+}
+
+/* ============================================================================
+   CANDLE BOUNDS
+   ========================================================================== */
+
+export async function getCandleBounds(
+  symbol,
+  currency = "USD"
+) {
+  const [
+    earliest,
+    latest,
+  ] = await Promise.all([
+    getEarliestCandle(
+      symbol,
+      currency
+    ),
+
+    getLatestCandle(
+      symbol,
+      currency
+    ),
+  ]);
+
+  return {
+    earliest,
+    latest,
+  };
+}
+
+/* ============================================================================
+   GET CANDLES
+   ========================================================================== */
+
+/**
+ * Existing compatible API.
+ *
+ * Crypto:
+ *
+ *   getCandles(
+ *     "BTC",
+ *     "GBP",
+ *     start,
+ *     end
+ *   )
+ *
+ * Metals:
+ *
+ *   getCandles(
+ *     "XAU",
+ *     "USD",
+ *     start,
+ *     end
+ *   )
+ */
+export async function getCandles(
+  symbol,
+  currency,
+  startTimestamp,
+  endTimestamp
+) {
+  const collection =
+    cryptoCandlesCollection(
+      symbol,
+      currency
+    );
+
+  const start =
+    normalizeTimestamp(
+      startTimestamp
+    );
+
+  const end =
+    normalizeTimestamp(
+      endTimestamp
+    );
+
+  if (start > end) {
+    throw new Error(
+      "startTimestamp must be before endTimestamp"
+    );
+  }
+
+  const snapshot =
+    await collection
+      .where(
+        "timestamp",
+        ">=",
+        start
+      )
+      .where(
+        "timestamp",
+        "<=",
+        end
+      )
+      .orderBy(
+        "timestamp",
+        "asc"
+      )
+      .get();
+
+  return snapshot.docs.map(
+    (doc) => ({
+      id: doc.id,
+      ...doc.data(),
+    })
+  );
+}
+
+/* ============================================================================
+   SUPPORTED SERIES
+   ========================================================================== */
+
+export function getSupportedSeries() {
+  const series = [];
+
+  for (
+    const symbol of
+      SUPPORTED_SYMBOLS
+  ) {
+    for (
+      const currency of
+        SUPPORTED_CURRENCIES
+    ) {
+      series.push({
+        symbol,
+        currency,
+      });
+    }
+  }
+
+  return series;
 }
