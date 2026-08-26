@@ -8,7 +8,7 @@ const router = express.Router();
 
 /**
  * GET /api/market-data/:symbol
- *
+ *n
  * Example:
  *
  * /api/market-data/BTC?start=2026-08-01&end=2026-08-21

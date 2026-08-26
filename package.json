@@ -6,6 +6,7 @@
   "scripts": {
     "start": "NODE_ENV=production node index.js",
     "dev": "nodemon index.js",
+    "pull": "node pull-market-data.js",
     "lint": "eslint .",
     "knip": "knip",
     "check": "npm run lint && npm run knip"
