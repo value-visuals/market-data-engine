@@ -19,7 +19,6 @@ router.get("/:symbol", (req, res) => {
     <html>
       <head>
         <meta charset="UTF-8" />
-
         <meta
           name="viewport"
           content="width=device-width, initial-scale=1.0"
@@ -59,8 +58,7 @@ router.get("/:symbol", (req, res) => {
             align-items: center;
           }
 
-          button,
-          #currency {
+          button {
             padding: 8px 14px;
             border: 1px solid #374151;
             border-radius: 6px;
@@ -70,14 +68,19 @@ router.get("/:symbol", (req, res) => {
             font-size: 14px;
           }
 
-          button:hover,
-          #currency:hover {
+          button:hover:not(:disabled) {
             background: #374151;
           }
 
-          button.active {
+          button.active,
+          button.active:hover {
             background: #2563eb;
             border-color: #3b82f6;
+          }
+
+          button:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
           }
 
           .chart-container {
@@ -114,11 +117,9 @@ router.get("/:symbol", (req, res) => {
           <button data-range="6M">6M</button>
           <button data-range="1Y">1Y</button>
 
-          <select id="currency" aria-label="Quote currency">
-            <option value="USD">USD</option>
-            <option value="EUR">EUR</option>
-            <option value="GBP">GBP</option>
-          </select>
+          <button data-currency="USD">USD</button>
+          <button data-currency="EUR">EUR</button>
+          <button data-currency="GBP">GBP</button>
         </div>
 
         <div id="status" class="status">
@@ -136,8 +137,14 @@ router.get("/:symbol", (req, res) => {
           const isMetal = ["XAU", "XAG"].includes(symbol);
 
           const statusElement = document.getElementById("status");
-          const currencySelector = document.getElementById("currency");
-          const rangeButtons = document.querySelectorAll("[data-range]");
+
+          const rangeButtons = document.querySelectorAll(
+            "[data-range]"
+          );
+
+          const currencyButtons = document.querySelectorAll(
+            "[data-currency]"
+          );
 
           let chart = null;
           let candles = [];
@@ -162,14 +169,34 @@ router.get("/:symbol", (req, res) => {
             currentCurrency = "USD";
           }
 
-          currencySelector.value = currentCurrency;
-
           /**
+           * Currency buttons.
+           *
            * Gold and silver currently support USD only.
            */
-          if (isMetal) {
-            currencySelector.disabled = true;
-            currencySelector.title = "USD only";
+          function updateActiveCurrency() {
+            currencyButtons.forEach(button => {
+              const currency = button.dataset.currency;
+
+              const disabled =
+                isMetal && currency !== "USD";
+
+              button.classList.toggle(
+                "active",
+                currency === currentCurrency
+              );
+
+              button.disabled = disabled;
+
+              button.title = disabled
+                ? "USD only"
+                : "";
+
+              button.setAttribute(
+                "aria-pressed",
+                String(currency === currentCurrency)
+              );
+            });
           }
 
           /**
@@ -222,7 +249,9 @@ router.get("/:symbol", (req, res) => {
                 break;
 
               default:
-                throw new Error("Unsupported range: " + range);
+                throw new Error(
+                  "Unsupported range: " + range
+                );
             }
 
             return {
@@ -232,7 +261,7 @@ router.get("/:symbol", (req, res) => {
           }
 
           /**
-           * Convert timestamps into milliseconds.
+           * Normalize Firebase timestamps into milliseconds.
            *
            * Supports:
            * - Millisecond timestamps
@@ -260,7 +289,10 @@ router.get("/:symbol", (req, res) => {
             if (typeof value === "string") {
               const numeric = Number(value);
 
-              if (value.trim() && Number.isFinite(numeric)) {
+              if (
+                value.trim() &&
+                Number.isFinite(numeric)
+              ) {
                 return numeric < 10_000_000_000
                   ? numeric * 1000
                   : numeric;
@@ -278,7 +310,8 @@ router.get("/:symbol", (req, res) => {
                 return (
                   Number(value.seconds) * 1000 +
                   Math.floor(
-                    Number(value.nanoseconds || 0) / 1_000_000
+                    Number(value.nanoseconds || 0) /
+                    1_000_000
                   )
                 );
               }
@@ -287,7 +320,8 @@ router.get("/:symbol", (req, res) => {
                 return (
                   Number(value._seconds) * 1000 +
                   Math.floor(
-                    Number(value._nanoseconds || 0) / 1_000_000
+                    Number(value._nanoseconds || 0) /
+                    1_000_000
                   )
                 );
               }
@@ -316,7 +350,7 @@ router.get("/:symbol", (req, res) => {
           /**
            * Normalize Firebase candles.
            *
-           * Retain full OHLCV data for tooltips.
+           * Retain OHLCV data.
            * Remove duplicate timestamps.
            * Sort chronologically.
            */
@@ -328,7 +362,10 @@ router.get("/:symbol", (req, res) => {
             const unique = new Map();
 
             for (const candle of input) {
-              if (!candle || typeof candle !== "object") {
+              if (
+                !candle ||
+                typeof candle !== "object"
+              ) {
                 continue;
               }
 
@@ -358,10 +395,9 @@ router.get("/:symbol", (req, res) => {
           }
 
           /**
-           * Chart.js time-series data.
+           * Use real x/y coordinates for Chart.js.
            *
-           * Real timestamps are used as x coordinates.
-           * No artificial labels or equal spacing.
+           * Do not generate a labels array.
            */
           function createChartData() {
             return candles.map(candle => ({
@@ -371,7 +407,7 @@ router.get("/:symbol", (req, res) => {
           }
 
           /**
-           * Format values using the selected currency.
+           * Format prices using the selected currency.
            */
           function formatPrice(value) {
             const number = Number(value);
@@ -388,8 +424,10 @@ router.get("/:symbol", (req, res) => {
           }
 
           /**
-           * Render the chart.
-           * Preserve original Chart.js styling.
+           * Render the market chart.
+           *
+           * Preserve original Chart.js appearance,
+           * time axis, and OHLCV tooltips.
            */
           function renderChart() {
             const canvas = document.getElementById("chart");
@@ -407,12 +445,14 @@ router.get("/:symbol", (req, res) => {
               data: {
                 datasets: [
                   {
-                    label: symbol + "/" + currentCurrency + " Close",
+                    label:
+                      symbol + "/" + currentCurrency + " Close",
 
                     data,
 
                     borderColor: "#22c55e",
-                    backgroundColor: "rgba(34, 197, 94, 0.10)",
+                    backgroundColor:
+                      "rgba(34, 197, 94, 0.10)",
 
                     borderWidth: 2,
 
@@ -472,17 +512,22 @@ router.get("/:symbol", (req, res) => {
                               ? "N/A"
                               : formatPrice(candle.open)
                           ),
+
                           "High: " + (
                             candle.high == null
                               ? "N/A"
                               : formatPrice(candle.high)
                           ),
+
                           "Low: " + (
                             candle.low == null
                               ? "N/A"
                               : formatPrice(candle.low)
                           ),
-                          "Close: " + formatPrice(candle.close),
+
+                          "Close: " +
+                            formatPrice(candle.close),
+
                           "Volume: " + (
                             candle.volume ?? "N/A"
                           )
@@ -503,7 +548,8 @@ router.get("/:symbol", (req, res) => {
                     type: "time",
 
                     time: {
-                      tooltipFormat: "MMM d, yyyy HH:mm"
+                      tooltipFormat:
+                        "MMM d, yyyy HH:mm"
                     },
 
                     ticks: {
@@ -513,7 +559,8 @@ router.get("/:symbol", (req, res) => {
                     },
 
                     grid: {
-                      color: "rgba(156, 163, 175, 0.1)"
+                      color:
+                        "rgba(156, 163, 175, 0.1)"
                     }
                   },
 
@@ -532,7 +579,8 @@ router.get("/:symbol", (req, res) => {
                     },
 
                     grid: {
-                      color: "rgba(156, 163, 175, 0.1)"
+                      color:
+                        "rgba(156, 163, 175, 0.1)"
                     }
                   }
                 }
@@ -541,7 +589,7 @@ router.get("/:symbol", (req, res) => {
           }
 
           /**
-           * Keep selected range button highlighted.
+           * Highlight the selected date range.
            */
           function updateActiveRange() {
             rangeButtons.forEach(button => {
@@ -553,10 +601,12 @@ router.get("/:symbol", (req, res) => {
           }
 
           /**
-           * Synchronize currency with browser URL.
+           * Synchronize currency with the browser URL.
            */
           function updateCurrencyUrl() {
-            const url = new URL(window.location.href);
+            const url = new URL(
+              window.location.href
+            );
 
             url.searchParams.set(
               "currency",
@@ -573,8 +623,8 @@ router.get("/:symbol", (req, res) => {
           /**
            * Load market data from the API.
            *
-           * Currency and date range are independent.
-           * Abort prior requests to avoid stale responses.
+           * Preserve independent currency and range state.
+           * Abort previous requests when controls change.
            */
           async function loadChart(range = currentRange) {
             currentRange = range;
@@ -622,9 +672,6 @@ router.get("/:symbol", (req, res) => {
                 return;
               }
 
-              /**
-               * Normalize candles and preserve OHLCV.
-               */
               candles = normalizeCandles(
                 result.candles || []
               );
@@ -666,6 +713,7 @@ router.get("/:symbol", (req, res) => {
                 firstDate +
                 " → " +
                 lastDate;
+
             } catch (error) {
               if (error.name === "AbortError") {
                 return;
@@ -686,6 +734,7 @@ router.get("/:symbol", (req, res) => {
               statusElement.classList.add("error");
               statusElement.textContent =
                 "Failed to load market data.";
+
             } finally {
               if (requestController === controller) {
                 requestController = null;
@@ -694,24 +743,34 @@ router.get("/:symbol", (req, res) => {
           }
 
           /**
-           * Currency selector.
+           * Currency button handling.
            *
-           * Preserve range when currency changes.
+           * Switching currencies preserves the date range.
            */
-          currencySelector.addEventListener(
-            "change",
-            () => {
-              currentCurrency = currencySelector.value;
+          currencyButtons.forEach(button => {
+            button.addEventListener("click", () => {
+              const selectedCurrency =
+                button.dataset.currency;
 
+              if (
+                selectedCurrency === currentCurrency ||
+                (isMetal && selectedCurrency !== "USD")
+              ) {
+                return;
+              }
+
+              currentCurrency = selectedCurrency;
+
+              updateActiveCurrency();
               updateCurrencyUrl();
               loadChart(currentRange);
-            }
-          );
+            });
+          });
 
           /**
-           * Date range buttons.
+           * Range button handling.
            *
-           * Preserve currency when range changes.
+           * Switching date ranges preserves currency.
            */
           rangeButtons.forEach(button => {
             button.addEventListener("click", () => {
@@ -722,6 +781,7 @@ router.get("/:symbol", (req, res) => {
           /**
            * Initial chart load.
            */
+          updateActiveCurrency();
           loadChart(currentRange);
         </script>
       </body>
