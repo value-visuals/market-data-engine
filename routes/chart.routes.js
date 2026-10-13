@@ -1,3 +1,4 @@
+
 import express from "express";
 
 const router = express.Router();
@@ -6,6 +7,12 @@ router.get("/:symbol", (req, res) => {
   const symbol = String(req.params.symbol)
     .trim()
     .toUpperCase();
+
+  const supportedSymbols = ["BTC", "ETH", "XMR", "XAU", "XAG"];
+
+  if (!supportedSymbols.includes(symbol)) {
+    return res.status(404).send("Unsupported market symbol");
+  }
 
   res.send(`
     <!DOCTYPE html>
@@ -49,9 +56,11 @@ router.get("/:symbol", (req, res) => {
             display: flex;
             gap: 8px;
             flex-wrap: wrap;
+            align-items: center;
           }
 
-          button {
+          button,
+          #currency {
             padding: 8px 14px;
             border: 1px solid #374151;
             border-radius: 6px;
@@ -61,7 +70,8 @@ router.get("/:symbol", (req, res) => {
             font-size: 14px;
           }
 
-          button:hover {
+          button:hover,
+          #currency:hover {
             background: #374151;
           }
 
@@ -90,7 +100,6 @@ router.get("/:symbol", (req, res) => {
       </head>
 
       <body>
-
         <h1>${symbol}</h1>
 
         <div class="toolbar">
@@ -104,6 +113,12 @@ router.get("/:symbol", (req, res) => {
           <button data-range="3M">3M</button>
           <button data-range="6M">6M</button>
           <button data-range="1Y">1Y</button>
+
+          <select id="currency" aria-label="Quote currency">
+            <option value="USD">USD</option>
+            <option value="EUR">EUR</option>
+            <option value="GBP">GBP</option>
+          </select>
         </div>
 
         <div id="status" class="status">
@@ -115,11 +130,51 @@ router.get("/:symbol", (req, res) => {
         </div>
 
         <script>
+          const symbol = "${symbol}";
+
+          const supportedCurrencies = ["USD", "EUR", "GBP"];
+          const isMetal = ["XAU", "XAG"].includes(symbol);
+
+          const statusElement = document.getElementById("status");
+          const currencySelector = document.getElementById("currency");
+          const rangeButtons = document.querySelectorAll("[data-range]");
+
           let chart = null;
           let candles = [];
+          let currentRange = "1D";
+          let requestController = null;
+
+          /**
+           * Initialize currency from URL.
+           */
+          const urlParams = new URLSearchParams(
+            window.location.search
+          );
+
+          let currentCurrency = String(
+            urlParams.get("currency") || "USD"
+          ).trim().toUpperCase();
+
+          if (
+            !supportedCurrencies.includes(currentCurrency) ||
+            isMetal
+          ) {
+            currentCurrency = "USD";
+          }
+
+          currencySelector.value = currentCurrency;
+
+          /**
+           * Gold and silver currently support USD only.
+           */
+          if (isMetal) {
+            currencySelector.disabled = true;
+            currencySelector.title = "USD only";
+          }
 
           /**
            * Calculate the requested date range.
+           * Preserve existing range calculations.
            */
           function getStartDate(range) {
             const end = new Date();
@@ -127,69 +182,47 @@ router.get("/:symbol", (req, res) => {
 
             switch (range) {
               case "1D":
-                start.setDate(
-                  start.getDate() - 1
-                );
+                start.setDate(start.getDate() - 1);
                 break;
 
               case "2D":
-                start.setDate(
-                  start.getDate() - 2
-                );
+                start.setDate(start.getDate() - 2);
                 break;
 
               case "3D":
-                start.setDate(
-                  start.getDate() - 3
-                );
+                start.setDate(start.getDate() - 3);
                 break;
 
               case "7D":
-                start.setDate(
-                  start.getDate() - 7
-                );
+                start.setDate(start.getDate() - 7);
                 break;
 
               case "14D":
-                start.setDate(
-                  start.getDate() - 14
-                );
+                start.setDate(start.getDate() - 14);
                 break;
 
               case "1M":
-                start.setMonth(
-                  start.getMonth() - 1
-                );
+                start.setMonth(start.getMonth() - 1);
                 break;
 
               case "2M":
-                start.setMonth(
-                  start.getMonth() - 2
-                );
+                start.setMonth(start.getMonth() - 2);
                 break;
 
               case "3M":
-                start.setMonth(
-                  start.getMonth() - 3
-                );
+                start.setMonth(start.getMonth() - 3);
                 break;
 
               case "6M":
-                start.setMonth(
-                  start.getMonth() - 6
-                );
+                start.setMonth(start.getMonth() - 6);
                 break;
 
               case "1Y":
-                start.setFullYear(
-                  start.getFullYear() - 1
-                );
+                start.setFullYear(start.getFullYear() - 1);
                 break;
 
               default:
-                throw new Error(
-                  "Unsupported range: " + range
-                );
+                throw new Error("Unsupported range: " + range);
             }
 
             return {
@@ -199,22 +232,19 @@ router.get("/:symbol", (req, res) => {
           }
 
           /**
-           * Convert a Firebase timestamp into
-           * a JavaScript millisecond timestamp.
+           * Convert timestamps into milliseconds.
            *
            * Supports:
-           *
-           *   number
-           *   string
-           *   Firestore Timestamp-like objects
-           *   { _seconds, _nanoseconds }
-           *   { seconds, nanoseconds }
+           * - Millisecond timestamps
+           * - Second timestamps
+           * - Numeric strings
+           * - ISO date strings
+           * - Firestore Timestamp-like objects
+           * - Firestore _seconds/_nanoseconds
+           * - toMillis() and toDate()
            */
           function normalizeTimestamp(value) {
-            if (
-              value === null ||
-              value === undefined
-            ) {
+            if (value === null || value === undefined) {
               return null;
             }
 
@@ -222,127 +252,59 @@ router.get("/:symbol", (req, res) => {
               typeof value === "number" &&
               Number.isFinite(value)
             ) {
-              /*
-               * Your ingestion code currently stores
-               * CoinGecko timestamps in milliseconds.
-               *
-               * If a value looks like seconds,
-               * convert it to milliseconds.
-               */
-              if (value < 10_000_000_000) {
-                return value * 1000;
-              }
-
-              return value;
+              return value < 10_000_000_000
+                ? value * 1000
+                : value;
             }
 
             if (typeof value === "string") {
               const numeric = Number(value);
 
-              if (Number.isFinite(numeric)) {
-                if (
-                  numeric <
-                  10_000_000_000
-                ) {
-                  return numeric * 1000;
-                }
-
-                return numeric;
+              if (value.trim() && Number.isFinite(numeric)) {
+                return numeric < 10_000_000_000
+                  ? numeric * 1000
+                  : numeric;
               }
 
-              const parsed =
-                Date.parse(value);
+              const parsed = Date.parse(value);
 
-              if (
-                Number.isFinite(parsed)
-              ) {
-                return parsed;
-              }
-
-              return null;
+              return Number.isFinite(parsed)
+                ? parsed
+                : null;
             }
 
-            /*
-             * Firestore Timestamp format.
-             */
-            if (
-              typeof value === "object"
-            ) {
-              if (
-                Number.isFinite(
-                  value.seconds
-                )
-              ) {
+            if (typeof value === "object") {
+              if (Number.isFinite(value.seconds)) {
                 return (
-                  Number(value.seconds) *
-                    1000 +
+                  Number(value.seconds) * 1000 +
                   Math.floor(
-                    Number(
-                      value.nanoseconds || 0
-                    ) / 1_000_000
+                    Number(value.nanoseconds || 0) / 1_000_000
                   )
                 );
               }
 
-              /*
-               * Some Firebase serializers expose
-               * _seconds / _nanoseconds.
-               */
-              if (
-                Number.isFinite(
-                  value._seconds
-                )
-              ) {
+              if (Number.isFinite(value._seconds)) {
                 return (
-                  Number(value._seconds) *
-                    1000 +
+                  Number(value._seconds) * 1000 +
                   Math.floor(
-                    Number(
-                      value._nanoseconds || 0
-                    ) / 1_000_000
+                    Number(value._nanoseconds || 0) / 1_000_000
                   )
                 );
               }
 
-              /*
-               * Firestore Timestamp objects may
-               * provide toMillis().
-               */
-              if (
-                typeof value.toMillis ===
-                "function"
-              ) {
-                const milliseconds =
-                  value.toMillis();
+              if (typeof value.toMillis === "function") {
+                const milliseconds = value.toMillis();
 
-                if (
-                  Number.isFinite(
-                    milliseconds
-                  )
-                ) {
+                if (Number.isFinite(milliseconds)) {
                   return milliseconds;
                 }
               }
 
-              /*
-               * Firestore Timestamp-like
-               * toDate().
-               */
-              if (
-                typeof value.toDate ===
-                "function"
-              ) {
-                const date =
-                  value.toDate();
+              if (typeof value.toDate === "function") {
+                const date = value.toDate();
+                const milliseconds = date.getTime();
 
-                const milliseconds =
-                  date.getTime();
-
-                if (
-                  Number.isFinite(
-                    milliseconds
-                  )
-                ) {
+                if (Number.isFinite(milliseconds)) {
                   return milliseconds;
                 }
               }
@@ -352,39 +314,29 @@ router.get("/:symbol", (req, res) => {
           }
 
           /**
-           * Normalize and sort the data returned
-           * from Firebase.
+           * Normalize Firebase candles.
+           *
+           * Retain full OHLCV data for tooltips.
+           * Remove duplicate timestamps.
+           * Sort chronologically.
            */
           function normalizeCandles(input) {
-            if (
-              !Array.isArray(input)
-            ) {
+            if (!Array.isArray(input)) {
               return [];
             }
 
-            const unique =
-              new Map();
+            const unique = new Map();
 
-            for (
-              const candle of input
-            ) {
-              if (
-                !candle ||
-                typeof candle !==
-                  "object"
-              ) {
+            for (const candle of input) {
+              if (!candle || typeof candle !== "object") {
                 continue;
               }
 
-              const timestamp =
-                normalizeTimestamp(
-                  candle.timestamp
-                );
+              const timestamp = normalizeTimestamp(
+                candle.timestamp
+              );
 
-              const close =
-                Number(
-                  candle.close
-                );
+              const close = Number(candle.close);
 
               if (
                 timestamp === null ||
@@ -393,457 +345,385 @@ router.get("/:symbol", (req, res) => {
                 continue;
               }
 
-              /*
-               * Use timestamp as the key.
-               *
-               * This protects the chart from
-               * duplicate Firebase records.
-               */
-              unique.set(
+              unique.set(timestamp, {
+                ...candle,
                 timestamp,
-                {
-                  ...candle,
-                  timestamp,
-                  close
-                }
-              );
+                close
+              });
             }
 
-            return Array.from(
-              unique.values()
-            ).sort(
-              (a, b) =>
-                a.timestamp -
-                b.timestamp
+            return Array.from(unique.values()).sort(
+              (a, b) => a.timestamp - b.timestamp
             );
           }
 
           /**
-           * Create the Chart.js time-series data.
+           * Chart.js time-series data.
            *
-           * IMPORTANT:
-           *
-           * We do NOT create a labels array.
-           *
-           * Instead we give Chart.js real x/y
-           * coordinates.
-           *
-           * This allows Chart.js to understand that
-           *
-           * 10:00 → 10:15
-           *
-           * is different from
-           *
-           * 10:15 → 12:00.
+           * Real timestamps are used as x coordinates.
+           * No artificial labels or equal spacing.
            */
           function createChartData() {
-            return candles.map(
-              candle => ({
-                x: candle.timestamp,
-                y: candle.close
-              })
-            );
+            return candles.map(candle => ({
+              x: candle.timestamp,
+              y: candle.close
+            }));
           }
 
           /**
-           * Create the chart.
+           * Format values using the selected currency.
+           */
+          function formatPrice(value) {
+            const number = Number(value);
+
+            if (!Number.isFinite(number)) {
+              return "N/A";
+            }
+
+            return new Intl.NumberFormat(undefined, {
+              style: "currency",
+              currency: currentCurrency,
+              maximumFractionDigits: 2
+            }).format(number);
+          }
+
+          /**
+           * Render the chart.
+           * Preserve original Chart.js styling.
            */
           function renderChart() {
-            const canvas =
-              document.getElementById(
-                "chart"
-              );
+            const canvas = document.getElementById("chart");
 
             if (chart) {
               chart.destroy();
               chart = null;
             }
 
-            const data =
-              createChartData();
+            const data = createChartData();
 
-            chart = new Chart(
-              canvas,
-              {
-                type: "line",
+            chart = new Chart(canvas, {
+              type: "line",
 
-                data: {
-                  datasets: [
-                    {
-                      label:
-                        "${symbol} Close",
+              data: {
+                datasets: [
+                  {
+                    label: symbol + "/" + currentCurrency + " Close",
 
-                      data,
+                    data,
 
-                      borderColor:
-                        "#22c55e",
+                    borderColor: "#22c55e",
+                    backgroundColor: "rgba(34, 197, 94, 0.10)",
 
-                      backgroundColor:
-                        "rgba(34, 197, 94, 0.10)",
+                    borderWidth: 2,
 
-                      borderWidth: 2,
+                    pointRadius: 0,
+                    pointHoverRadius: 5,
 
-                      /*
-                       * Do not draw every point.
-                       *
-                       * The actual timestamp is still
-                       * preserved.
-                       */
-                      pointRadius: 0,
+                    tension: 0,
+                    fill: true,
 
-                      pointHoverRadius: 5,
+                    parsing: false
+                  }
+                ]
+              },
 
-                      /*
-                       * Disable smoothing while
-                       * validating market data.
-                       */
-                      tension: 0,
+              options: {
+                responsive: true,
+                maintainAspectRatio: false,
 
-                      fill: true,
-
-                      /*
-                       * Tell Chart.js that x contains
-                       * time values.
-                       */
-                      parsing: false
-                    }
-                  ]
+                interaction: {
+                  mode: "nearest",
+                  intersect: false
                 },
 
-                options: {
-                  responsive: true,
+                plugins: {
+                  tooltip: {
+                    enabled: true,
 
-                  maintainAspectRatio: false,
+                    callbacks: {
+                      title: function(context) {
+                        if (!context.length) {
+                          return "";
+                        }
 
-                  interaction: {
-                    mode: "nearest",
-                    intersect: false
-                  },
+                        const index = context[0].dataIndex;
+                        const candle = candles[index];
 
-                  plugins: {
-                    tooltip: {
-                      enabled: true,
+                        if (!candle) {
+                          return "";
+                        }
 
-                      callbacks: {
-                        title:
-                          function(
-                            context
-                          ) {
-                            if (
-                              !context
-                                .length
-                            ) {
-                              return "";
-                            }
+                        return new Date(
+                          candle.timestamp
+                        ).toLocaleString();
+                      },
 
-                            const index =
-                              context[0]
-                                .dataIndex;
+                      label: function(context) {
+                        const index = context.dataIndex;
+                        const candle = candles[index];
 
-                            const candle =
-                              candles[
-                                index
-                              ];
+                        if (!candle) {
+                          return "";
+                        }
 
-                            if (
-                              !candle
-                            ) {
-                              return "";
-                            }
-
-                            return new Date(
-                              candle.timestamp
-                            ).toLocaleString();
-                          },
-
-                        label:
-                          function(
-                            context
-                          ) {
-                            const index =
-                              context
-                                .dataIndex;
-
-                            const candle =
-                              candles[
-                                index
-                              ];
-
-                            if (
-                              !candle
-                            ) {
-                              return "";
-                            }
-
-                            return [
-                              "Open: " +
-                                (
-                                  candle.open ??
-                                  "N/A"
-                                ),
-
-                              "High: " +
-                                (
-                                  candle.high ??
-                                  "N/A"
-                                ),
-
-                              "Low: " +
-                                (
-                                  candle.low ??
-                                  "N/A"
-                                ),
-
-                              "Close: " +
-                                (
-                                  candle.close ??
-                                  "N/A"
-                                ),
-
-                              "Volume: " +
-                                (
-                                  candle.volume ??
-                                  "N/A"
-                                )
-                            ];
-                          }
-                      }
-                    },
-
-                    legend: {
-                      labels: {
-                        color:
-                          "#ffffff"
+                        return [
+                          "Open: " + (
+                            candle.open == null
+                              ? "N/A"
+                              : formatPrice(candle.open)
+                          ),
+                          "High: " + (
+                            candle.high == null
+                              ? "N/A"
+                              : formatPrice(candle.high)
+                          ),
+                          "Low: " + (
+                            candle.low == null
+                              ? "N/A"
+                              : formatPrice(candle.low)
+                          ),
+                          "Close: " + formatPrice(candle.close),
+                          "Volume: " + (
+                            candle.volume ?? "N/A"
+                          )
+                        ];
                       }
                     }
                   },
 
-                  scales: {
-                    x: {
-                      type: "time",
+                  legend: {
+                    labels: {
+                      color: "#ffffff"
+                    }
+                  }
+                },
 
-                      /*
-                       * Chart.js + Luxon will
-                       * automatically choose an
-                       * appropriate display format
-                       * based on the selected range.
-                       */
-                      time: {
-                        tooltipFormat:
-                          "MMM d, yyyy HH:mm"
-                      },
+                scales: {
+                  x: {
+                    type: "time",
 
-                      ticks: {
-                        color:
-                          "#9ca3af",
+                    time: {
+                      tooltipFormat: "MMM d, yyyy HH:mm"
+                    },
 
-                        maxRotation: 0,
+                    ticks: {
+                      color: "#9ca3af",
+                      maxRotation: 0,
+                      autoSkip: true
+                    },
 
-                        autoSkip: true
-                      },
+                    grid: {
+                      color: "rgba(156, 163, 175, 0.1)"
+                    }
+                  },
 
-                      grid: {
-                        color:
-                          "rgba(156, 163, 175, 0.1)"
+                  y: {
+                    ticks: {
+                      color: "#9ca3af",
+
+                      callback: function(value) {
+                        return Number(value).toLocaleString(
+                          undefined,
+                          {
+                            maximumFractionDigits: 2
+                          }
+                        );
                       }
                     },
 
-                    y: {
-                      ticks: {
-                        color:
-                          "#9ca3af",
-
-                        callback:
-                          function(
-                            value
-                          ) {
-                            return Number(
-                              value
-                            ).toLocaleString(
-                              undefined,
-                              {
-                                maximumFractionDigits:
-                                  2
-                              }
-                            );
-                          }
-                      },
-
-                      grid: {
-                        color:
-                          "rgba(156, 163, 175, 0.1)"
-                      }
+                    grid: {
+                      color: "rgba(156, 163, 175, 0.1)"
                     }
                   }
                 }
               }
+            });
+          }
+
+          /**
+           * Keep selected range button highlighted.
+           */
+          function updateActiveRange() {
+            rangeButtons.forEach(button => {
+              button.classList.toggle(
+                "active",
+                button.dataset.range === currentRange
+              );
+            });
+          }
+
+          /**
+           * Synchronize currency with browser URL.
+           */
+          function updateCurrencyUrl() {
+            const url = new URL(window.location.href);
+
+            url.searchParams.set(
+              "currency",
+              currentCurrency
+            );
+
+            window.history.replaceState(
+              {},
+              "",
+              url.pathname + url.search + url.hash
             );
           }
 
           /**
-           * Load market data from Firebase API.
+           * Load market data from the API.
+           *
+           * Currency and date range are independent.
+           * Abort prior requests to avoid stale responses.
            */
-          async function loadChart(
-            range
-          ) {
-            const status =
-              document.getElementById(
-                "status"
-              );
+          async function loadChart(range = currentRange) {
+            currentRange = range;
+            updateActiveRange();
 
-            status.classList.remove(
-              "error"
-            );
+            if (requestController) {
+              requestController.abort();
+            }
 
-            status.textContent =
-              "Loading...";
+            const controller = new AbortController();
+            requestController = controller;
+
+            statusElement.classList.remove("error");
+            statusElement.textContent = "Loading...";
 
             try {
-              const dates =
-                getStartDate(
-                  range
-                );
+              const dates = getStartDate(currentRange);
 
-              const params =
-                new URLSearchParams({
-                  start: dates.start,
-                  end: dates.end
-                });
+              const params = new URLSearchParams({
+                currency: currentCurrency,
+                start: dates.start,
+                end: dates.end
+              });
 
-              const response =
-                await fetch(
-                  "/api/market-data/${symbol}?" +
-                    params.toString()
-                );
+              const response = await fetch(
+                "/api/market-data/" +
+                  encodeURIComponent(symbol) +
+                  "?" +
+                  params.toString(),
+                {
+                  signal: controller.signal
+                }
+              );
 
-              if (
-                !response.ok
-              ) {
+              if (!response.ok) {
                 throw new Error(
                   "Failed to load market data: " +
-                    response.status
+                  response.status
                 );
               }
 
-              const result =
-                await response.json();
+              const result = await response.json();
 
-              /*
-               * Normalize timestamps,
-               * remove duplicate timestamps,
-               * and sort chronologically.
+              if (controller.signal.aborted) {
+                return;
+              }
+
+              /**
+               * Normalize candles and preserve OHLCV.
                */
-              candles =
-                normalizeCandles(
-                  result.candles ||
-                    []
-                );
+              candles = normalizeCandles(
+                result.candles || []
+              );
 
-              if (
-                candles.length === 0
-              ) {
+              if (candles.length === 0) {
                 if (chart) {
                   chart.destroy();
                   chart = null;
                 }
 
-                status.textContent =
+                statusElement.textContent =
                   "No market data found for " +
-                  range +
+                  symbol +
+                  "/" +
+                  currentCurrency +
+                  " over " +
+                  currentRange +
                   ".";
 
                 return;
               }
 
-              /*
-               * Render using real timestamps.
-               */
               renderChart();
 
-              const first =
-                candles[0];
+              const first = candles[0];
+              const last = candles[candles.length - 1];
 
-              const last =
-                candles[
-                  candles.length - 1
-                ];
+              const firstDate = new Date(
+                first.timestamp
+              ).toLocaleString();
 
-              const firstDate =
-                new Date(
-                  first.timestamp
-                ).toLocaleString();
+              const lastDate = new Date(
+                last.timestamp
+              ).toLocaleString();
 
-              const lastDate =
-                new Date(
-                  last.timestamp
-                ).toLocaleString();
-
-              status.textContent =
+              statusElement.textContent =
                 candles.length +
                 " data points | " +
                 firstDate +
                 " → " +
                 lastDate;
             } catch (error) {
+              if (error.name === "AbortError") {
+                return;
+              }
+
               console.error(
+                "[market-data.chart] Failed to load chart:",
                 error
               );
 
-              status.classList.add(
-                "error"
-              );
+              if (chart) {
+                chart.destroy();
+                chart = null;
+              }
 
-              status.textContent =
+              candles = [];
+
+              statusElement.classList.add("error");
+              statusElement.textContent =
                 "Failed to load market data.";
+            } finally {
+              if (requestController === controller) {
+                requestController = null;
+              }
             }
           }
 
           /**
-           * Range button handling.
+           * Currency selector.
+           *
+           * Preserve range when currency changes.
            */
-          document
-            .querySelectorAll(
-              "[data-range]"
-            )
-            .forEach(
-              button => {
-                button.addEventListener(
-                  "click",
-                  () => {
-                    document
-                      .querySelectorAll(
-                        "[data-range]"
-                      )
-                      .forEach(
-                        btn =>
-                          btn.classList.remove(
-                            "active"
-                          )
-                      );
+          currencySelector.addEventListener(
+            "change",
+            () => {
+              currentCurrency = currencySelector.value;
 
-                    button.classList.add(
-                      "active"
-                    );
+              updateCurrencyUrl();
+              loadChart(currentRange);
+            }
+          );
 
-                    loadChart(
-                      button.dataset
-                        .range
-                    );
-                  }
-                );
-              }
-            );
-
-          /*
-           * Default range.
+          /**
+           * Date range buttons.
+           *
+           * Preserve currency when range changes.
            */
-          document
-            .querySelector(
-              '[data-range="1D"]'
-            )
-            .click();
+          rangeButtons.forEach(button => {
+            button.addEventListener("click", () => {
+              loadChart(button.dataset.range);
+            });
+          });
+
+          /**
+           * Initial chart load.
+           */
+          loadChart(currentRange);
         </script>
-
       </body>
     </html>
   `);
