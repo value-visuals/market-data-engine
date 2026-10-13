@@ -38,11 +38,52 @@ function getMarketSelection(req) {
     };
   }
 
-  return {
-    symbol,
-    currency,
-  };
+  return { symbol, currency };
 }
+
+/**
+ * GET /api/market-data
+ *
+ * API discovery endpoint.
+ */
+router.get("/", (req, res) => {
+  const markets = Object.fromEntries(
+    SUPPORTED_SYMBOLS.map(symbol => [
+      symbol,
+      USD_ONLY_SYMBOLS.includes(symbol)
+        ? ["USD"]
+        : [...SUPPORTED_CURRENCIES],
+    ])
+  );
+
+  return res.json({
+    name: "Market Data API",
+    status: "ok",
+    markets,
+    endpoints: {
+      historical: {
+        method: "GET",
+        path: "/api/market-data/:symbol",
+        parameters: {
+          currency: "USD, EUR, GBP (optional; defaults to USD)",
+          start: "ISO 8601 date or timestamp (required)",
+          end: "ISO 8601 date or timestamp (required)",
+        },
+        example:
+          "/api/market-data/BTC?currency=USD&start=2026-10-01&end=2026-10-13",
+      },
+      latest: {
+        method: "GET",
+        path: "/api/market-data/:symbol/latest",
+        parameters: {
+          currency: "USD, EUR, GBP (optional; defaults to USD)",
+        },
+        example:
+          "/api/market-data/BTC/latest?currency=USD",
+      },
+    },
+  });
+});
 
 /**
  * GET /api/market-data/:symbol
