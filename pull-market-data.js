@@ -1,7 +1,9 @@
+
 import "dotenv/config";
 
 import { ingestCrypto, backfillCrypto } from "./jobs/crypto.job.js";
 import { ingestMetals, backfillMetals } from "./jobs/metals.job.js";
+import { startAssetMarketCapScheduler } from "./jobs/assetmarketcap.job.js";
 
 const INTERVAL_MS = 30 * 60 * 1000;
 let running = false;
@@ -58,6 +60,10 @@ async function start() {
   console.log(
     `[scheduler] Market Data Engine | Interval: ${INTERVAL_MS / 1000}s`
   );
+
+  // AssetMarketCap runs independently of crypto/metals ingestion.
+  // Firestore enforces its 8-hour refresh interval and monthly request limit.
+  startAssetMarketCapScheduler();
 
   if (!(await runBackfill())) {
     console.error("[scheduler] Backfill failed. Live ingestion stopped.");
