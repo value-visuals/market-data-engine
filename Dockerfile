@@ -1,6 +1,6 @@
 # Dockerfile
 
-FROM node:22-alpine
+FROM node:22.23.4-alpine
 
 # Production environment
 ENV NODE_ENV=production
